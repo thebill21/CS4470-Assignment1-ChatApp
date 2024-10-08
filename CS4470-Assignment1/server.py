@@ -33,6 +33,7 @@ def handle_client(client):
         username = client.recv(2048).decode('utf-8')
         if username != '':
             active_clients.append((username, client))
+            broadcast(f"[ANNOUNCEMENT]: [{username}] has joined the chat.")
             break
         else:
             print(f"Client's 'username' is empty.")

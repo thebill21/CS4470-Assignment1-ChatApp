@@ -26,8 +26,16 @@ def show_help():
     print(command_manual)
 
 def get_my_ip():
-    hostname = socket.gethostname()
-    ip_address = socket.gethostbyname(hostname)
+    # [Change] Use a reliable method to get the actual local IP address
+    try:
+        # Connect to an external address to get the local IP address
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip_address = s.getsockname()[0]
+        s.close()
+    except Exception as e:
+        print(f"Error: Unable to get local IP address: {e}")
+        ip_address = "127.0.0.1"  # Fallback to localhost
     print(f"IP Address: {ip_address}")
     return ip_address
 

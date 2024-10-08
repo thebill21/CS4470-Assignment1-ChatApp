@@ -8,7 +8,7 @@ connection_id = 0  # Connection identifier
 peer_port = None  # Port for this instance to listen on
 
 # Command options and manual
-commands = ['help', 'myip', 'myport', 'connect', 'list', 'terminate', 'send', 'exit']
+commands = ['help', 'myip', 'myport', 'connect', 'list', 'terminate', 'send', 'broadcast', 'exit']
 command_manual = """
 Available commands:
 1. help: Display information about the available user interface options or command manual.
@@ -18,7 +18,8 @@ Available commands:
 5. list: Display a numbered list of all the connections this process is part of.
 6. terminate <connection id.>: Terminate the connection listed under the specified number when LIST is used to display all connections.
 7. send <connection id> <message>: Send the message to the host on the connection that is designated by the number.
-8. exit: Close all connections and terminate this process.
+8. broadcast <message>: Send the message to all connected peers.
+9. exit: Close all connections and terminate this process.
 """
 
 def show_help():
@@ -44,7 +45,7 @@ def handle_client(client_socket, client_address):
         try:
             message = client_socket.recv(1024).decode('utf-8')
             if message:
-                # [Change] Updated message format to include the IP and port of the sender
+                # Display message with sender's IP and port
                 print(f"Message received from {client_address[0]}:{client_address[1]}\nMessage: {message}")
             else:
                 break
@@ -57,6 +58,19 @@ def handle_client(client_socket, client_address):
     print(f"Connection with {client_address} terminated.")
 
 def connect_to_peer(destination, port):
+    global connection_id
+
+    # Prevent self-connection
+    if destination == get_my_ip() and int(port) == peer_port:
+        print("Error: Cannot connect to yourself.")
+        return
+
+    # Check for existing connections to avoid duplicates
+    for conn_id, conn_data in connections.items():
+        if conn_data[1] == (destination, int(port)):
+            print(f"Error: Already connected to {destination}:{port}")
+            return
+
     try:
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         peer_socket.connect((destination, int(port)))
@@ -89,6 +103,12 @@ def send_message(conn_id, message):
     else:
         print(f"No such connection with ID: {conn_id}")
 
+def broadcast_message(message):
+    # Send the message to all connected peers
+    for conn_id, conn_data in connections.items():
+        conn_data[0].sendall(message.encode())
+    print("Broadcast message sent to all connected peers.")
+
 def exit_program():
     for conn in connections.values():
         conn[0].close()
@@ -97,7 +117,6 @@ def exit_program():
     sys.exit(0)
 
 def handle_peer_messages(peer_socket, peer_ip, peer_port):
-    # [Change] Added peer IP and port information for consistency in message display
     while True:
         try:
             message = peer_socket.recv(1024).decode('utf-8')
@@ -164,6 +183,11 @@ def main():
                 send_message(int(command[1]), " ".join(command[2:]))
             else:
                 print("Usage: send <connection id> <message>")
+        elif command[0] == 'broadcast':
+            if len(command) > 1:
+                broadcast_message(" ".join(command[1:]))
+            else:
+                print("Usage: broadcast <message>")
         elif command[0] == 'exit':
             exit_program()
 

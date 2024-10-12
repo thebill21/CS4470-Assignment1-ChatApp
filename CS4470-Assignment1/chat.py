@@ -5,6 +5,9 @@ import sys  # Importing sys to handle command-line arguments and system function
 # Global variables
 connections = {}  # Dictionary to store active connections in the format {id: (socket, address)}
 peer_port = None  # Global variable to store the port this instance is listening on
+connection_id_counter = 1  # Global counter for connection IDs
+available_ids = []  # List of reusable connection IDs
+connections_lock = threading.Lock()  # Lock to prevent race conditions on shared connection data
 
 # List of available commands and the command manual
 commands = ['help', 'myip', 'myport', 'connect', 'list', 'terminate', 'send', 'exit']
@@ -25,9 +28,19 @@ def show_help():
     print(command_manual)
 
 def get_my_ip():
-    """Retrieve and display the local IP address of the host machine."""
-    hostname = socket.gethostname()  # Get the hostname of the machine
-    ip_address = socket.gethostbyname(hostname)  # Resolve the hostname to an IP address
+    """Retrieve and display the correct local IP address."""
+    try:
+        # Open a dummy socket to an external server (Google's public DNS at 8.8.8.8)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Connect to the server (no actual data is sent)
+        s.connect(('8.8.8.8', 80))
+        # Get the IP address of the local machine
+        ip_address = s.getsockname()[0]
+        s.close()  # Close the socket after retrieving the IP
+    except Exception as e:
+        # If there's an error, default to localhost
+        print(f"Error retrieving IP: {e}")
+        ip_address = "127.0.0.1"
     print(f"IP Address: {ip_address}")
     return ip_address
 
@@ -35,85 +48,162 @@ def get_my_port():
     """Display the port this instance is listening on."""
     print(f"Listening on Port: {peer_port}")
 
+def assign_connection_id():
+    """Assign a reusable connection ID or create a new one if none are available."""
+    global connection_id_counter
+    if available_ids:  # Reuse an ID if available
+        return available_ids.pop(0)
+    else:  # Otherwise, create a new ID
+        connection_id = connection_id_counter
+        connection_id_counter += 1
+        return connection_id
+
 def handle_client(client_socket, client_address):
     """Handle messages from a connected client."""
-    global connection_id  # Access the global connection_id variable
+    global connection_id_counter
     print(f"Connection from {client_address} established.")  # Notify that a client has connected
-    connection_id = len(connections) + 1  # Assign an ID starting from 1 for the new connection
-    connections[connection_id] = (client_socket, client_address)  # Add the client to the connections dictionary
 
-    # Infinite loop to listen for messages from the client
-    while True:
-        try:
-            message = client_socket.recv(1024).decode('utf-8')  # Receive up to 1024 bytes of data from the client
-            if message:  # If a valid message is received
-                print(f"Message received from {client_address[0]}:{client_address[1]}\nMessage: {message}")  # Display the message
-            else:  # If no message is received, break the loop (connection closed)
+    try:
+        # Receive the listening port from the client
+        listening_port = client_socket.recv(1024).decode('utf-8')  # Receive the client's listening port as a string
+        print(f"Peer listening on port {listening_port}")
+
+        # Assign an ID starting from 1 for the new connection
+        with connections_lock:
+            connection_id = assign_connection_id()
+            connections[connection_id] = (client_socket, (client_address[0], listening_port))
+
+        # Infinite loop to listen for messages from the client
+        while True:
+            try:
+                message = client_socket.recv(1024).decode('utf-8')  # Receive up to 1024 bytes of data from the client
+                if message:  # If a valid message is received
+                    print(f"Message received from {client_address[0]}:{listening_port}\nMessage: {message}")
+                else:  # If no message is received, break the loop (connection closed)
+                    break
+            except Exception as e:
+                print(f"Error receiving message from {client_address}: {e}")
                 break
-        except:  # Handle any exceptions (e.g., client disconnected abruptly)
-            break
+
+    except Exception as e:
+        print(f"Error handling client {client_address}: {e}")
 
     # Remove the client after disconnection
     client_socket.close()  # Close the client's socket
-    del connections[connection_id]  # Remove the client from the connections dictionary
-    print(f"Connection with {client_address} terminated.")  # Notify that the client disconnected
+
+    # Check if the connection still exists in the dictionary before deleting it
+    with connections_lock:
+        if connection_id in connections:
+            del connections[connection_id]  # Remove the client from the connections dictionary
+            available_ids.append(connection_id)  # Make the ID reusable
+            print(f"Connection with {client_address} terminated.")  # Notify that the client disconnected
 
 def connect_to_peer(destination, port):
-    """Establish a connection to a remote peer."""
+    """Establish a connection to a remote peer if one does not already exist."""
+    with connections_lock:
+        # Check if a connection to the destination IP and port already exists
+        for conn_data in connections.values():
+            existing_ip, existing_port = conn_data[1]
+            if existing_ip == destination and existing_port == port:
+                print(f"Error: Already connected to {destination}:{port}")
+                return  # Prevent duplicate connections
+
     try:
         peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Create a TCP/IP socket
-        peer_socket.connect((destination, int(port)))  # Attempt to connect to the destination IP and port
+        peer_socket.connect((destination, int(port)))  # Connect to the destination IP and port
         print(f"Connected to {destination}:{port}.")  # Confirm successful connection
-        connections[len(connections) + 1] = (peer_socket, (destination, port))  # Add the connection to the dictionary
+
+        # Send this peer's listening port to the connected peer
+        peer_socket.sendall(str(peer_port).encode())  # Send our own listening port as a string
+
+        # Add the connection to the dictionary using destination IP and port
+        with connections_lock:
+            connection_id = assign_connection_id()
+            connections[connection_id] = (peer_socket, (destination, port))
 
         # Start a new thread to listen for messages from the connected peer
         threading.Thread(target=handle_peer_messages, args=(peer_socket, destination, port)).start()
+
     except Exception as e:  # Handle connection errors
         print(f"Failed to connect to {destination}:{port}. Error: {e}")
 
 def list_connections():
     """Display a numbered list of all active connections."""
     print("ID: IP Address      Port")  # Display header
-    for conn_id, conn_data in connections.items():  # Loop through all active connections
-        ip, port = conn_data[1]  # Extract the IP and port of each connection
-        print(f"{conn_id}: {ip}      {port}")  # Display the connection ID, IP, and port
+    with connections_lock:
+        for conn_id, conn_data in connections.items():  # Loop through all active connections
+            ip, port = conn_data[1]  # Extract the IP and listening port of each connection
+            print(f"{conn_id}: {ip}      {port}")  # Display the connection ID, IP, and port
 
 def terminate_connection(conn_id):
     """Terminate the connection with the specified ID."""
-    if conn_id in connections:  # Check if the connection ID exists
-        connections[conn_id][0].close()  # Close the connection's socket
-        del connections[conn_id]  # Remove the connection from the dictionary
-        print(f"Connection {conn_id} terminated.")  # Notify that the connection has been terminated
-    else:
-        print(f"No such connection with ID: {conn_id}")  # Error message if the connection ID doesn't exist
+    with connections_lock:
+        if conn_id in connections:  # Check if the connection ID exists
+            try:
+                connections[conn_id][0].close()  # Close the connection's socket
+                del connections[conn_id]  # Remove the connection from the dictionary
+                available_ids.append(conn_id)  # Reuse the connection ID
+                print(f"Connection {conn_id} terminated.")  # Notify that the connection has been terminated
+            except Exception as e:
+                print(f"Error terminating connection {conn_id}: {e}")
+        else:
+            print(f"No such connection with ID: {conn_id}")  # Error message if the connection ID doesn't exist
 
 def send_message(conn_id, message):
     """Send a message to the specified connection ID."""
-    if conn_id in connections:  # Check if the connection ID exists
-        connections[conn_id][0].sendall(message.encode())  # Send the message to the corresponding peer
-        print(f"Message sent to connection {conn_id}.")  # Confirm message sent
-    else:
-        print(f"No such connection with ID: {conn_id}")  # Error message if the connection ID doesn't exist
+    with connections_lock:
+        if conn_id in connections:  # Check if the connection ID exists
+            connections[conn_id][0].sendall(message.encode())  # Send the message to the corresponding peer
+            print(f"Message sent to connection {conn_id}.")  # Confirm message sent
+        else:
+            print(f"No such connection with ID: {conn_id}")  # Error message if the connection ID doesn't exist
 
 def exit_program():
-    """Close all connections and terminate the program."""
-    for conn in connections.values():  # Loop through all active connections
-        conn[0].close()  # Close each connection's socket
-    connections.clear()  # Clear the connections dictionary
-    print("All connections closed. Exiting program.")  # Notify that all connections have been closed
+    """Close all connections and notify all peers of the disconnection before terminating the program."""
+    # Notify all connected peers that this peer is exiting
+    with connections_lock:
+        for conn_id, conn_data in list(connections.items()):
+            try:
+                # Send a disconnection message to the peer
+                conn_data[0].sendall("exit".encode())
+            except Exception as e:
+                print(f"Error sending exit message to peer {conn_data[1]}: {e}")
+
+        # Now terminate the connections
+        for conn_id in list(connections.keys()):
+            terminate_connection(conn_id)  # Terminate each connection
+
+        connections.clear()  # Clear the connections dictionary
+        print("All connections closed. Exiting program.")  # Notify that all connections have been closed
     sys.exit(0)  # Exit the program
 
 def handle_peer_messages(peer_socket, peer_ip, peer_port):
-    """Listen for messages from a connected peer."""
+    """Listen for messages from a connected peer and handle disconnections."""
     while True:
         try:
             message = peer_socket.recv(1024).decode('utf-8')  # Receive up to 1024 bytes of data
-            if message:  # If a valid message is received
+            if message == "exit":  # If the peer is exiting
+                print(f"Peer at {peer_ip}:{peer_port} has exited the chat.")
+                break  # Exit the loop and close the connection
+            elif message:  # If a valid message is received
                 print(f"Message received from {peer_ip}:{peer_port}\nMessage: {message}")  # Display the message
             else:  # If no message is received, break the loop (connection closed)
                 break
-        except:  # Handle any exceptions (e.g., peer disconnected)
+        except Exception as e:
+            print(f"Error receiving message from {peer_ip}:{peer_port}: {e}")
             break
+
+    # Remove the peer after disconnection
+    peer_socket.close()  # Close the peer's socket
+    # Find the connection ID associated with this peer and remove it
+    with connections_lock:
+        for conn_id, conn_data in list(connections.items()):
+            if conn_data[1] == (peer_ip, peer_port):
+                if conn_id in connections:  # Extra check to avoid KeyError if already deleted
+                    del connections[conn_id]  # Remove the peer from the connections dictionary
+                    available_ids.append(conn_id)  # Reuse the connection ID
+                    print(f"Connection with {peer_ip}:{peer_port} terminated.")  # Notify that the peer disconnected
+                break
 
 def accept_clients(server_socket):
     """Accept incoming client connections and handle them in separate threads."""
@@ -145,6 +235,8 @@ def main():
     # Command interface loop
     while True:
         command = input(">> ").strip().split()  # Prompt user for a command
+        if len(command) == 0:  # Check if the input is empty
+            continue  # If empty, ignore and continue waiting for valid input
         if command[0] not in commands:  # If the command is not valid
             print("Invalid command. Type 'help' for a list of available commands.")  # Notify of invalid command
             continue  # Skip to the next command
